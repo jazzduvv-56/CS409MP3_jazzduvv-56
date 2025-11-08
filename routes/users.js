@@ -1,5 +1,6 @@
 var User = require('../models/user');
 var Task = require('../models/task');
+var mongoose = require('mongoose');
 
 module.exports = function (router) {
 
@@ -62,8 +63,9 @@ module.exports = function (router) {
             return res.status(400).json({ message: "Name and email are required", data: {} });
         }
 
-        // Users cannot be created with pending tasks
-        if (req.body.pendingTasks && req.body.pendingTasks.length > 0) {
+        // Disallow creation requests that include any pendingTasks field (even an empty array)
+        // Clients must not provide pendingTasks at creation time — they should be added via task creation or assignment flows.
+        if (Object.prototype.hasOwnProperty.call(req.body, 'pendingTasks')) {
             return res.status(400).json({ message: "Users cannot be created with pending tasks", data: {} });
         }
 
@@ -130,10 +132,19 @@ module.exports = function (router) {
             }
 
             var oldPendingTasks = user.pendingTasks || [];
-            var newPendingTasks = req.body.pendingTasks || [];
+            // Only treat pendingTasks as an update when the client provides the field.
+            var pendingTasksProvided = Object.prototype.hasOwnProperty.call(req.body, 'pendingTasks');
+            var newPendingTasks = pendingTasksProvided ? (req.body.pendingTasks || []) : undefined;
 
-            // Validate that all task IDs in newPendingTasks exist and are not completed
-            if (newPendingTasks.length > 0) {
+            // If client provided pendingTasks, validate that all task IDs in newPendingTasks exist and are not completed
+            if (pendingTasksProvided && newPendingTasks.length > 0) {
+                // Validate each provided id is a valid ObjectId to avoid CastError in queries
+                for (var i = 0; i < newPendingTasks.length; i++) {
+                    if (!mongoose.Types.ObjectId.isValid(newPendingTasks[i])) {
+                        return res.status(400).json({ message: "One or more task IDs are invalid", data: {} });
+                    }
+                }
+
                 Task.find({ _id: { $in: newPendingTasks } }).then(function (tasks) {
                     if (tasks.length !== newPendingTasks.length) {
                         return res.status(400).json({ message: "One or more task IDs do not exist", data: {} });
@@ -151,7 +162,7 @@ module.exports = function (router) {
                     res.status(500).json({ message: "Internal server error", data: {} });
                 });
             } else {
-                // No new tasks to validate, proceed
+                // No new tasks to validate (either none provided or empty array). Proceed with update.
                 updateUserWithTasks(user, oldPendingTasks, newPendingTasks, req, res);
             }
         }).catch(function (err) {
@@ -170,18 +181,15 @@ module.exports = function (router) {
         var nameChanged = user.name !== req.body.name;
         user.name = req.body.name;
         user.email = req.body.email;
-        user.pendingTasks = newPendingTasks;
+        // Only overwrite pendingTasks if the client provided the field
+        if (typeof newPendingTasks !== 'undefined') {
+            user.pendingTasks = (newPendingTasks || []).map(function (v) { return v.toString(); })
+                .filter(function (v, i, a) { return a.indexOf(v) === i; });
+        }
 
         // Save the updated user
         user.save().then(function (updatedUser) {
             // Handle two-way consistency: update tasks
-            var tasksToRemove = oldPendingTasks.filter(function (taskId) {
-                return newPendingTasks.indexOf(taskId) === -1;
-            });
-            var tasksToAdd = newPendingTasks.filter(function (taskId) {
-                return oldPendingTasks.indexOf(taskId) === -1;
-            });
-
             var promises = [];
 
             // If user name changed, update assignedUserName on ALL tasks assigned to this user
@@ -194,52 +202,61 @@ module.exports = function (router) {
                 );
             }
 
-            // Remove user from tasks no longer in pendingTasks
-            tasksToRemove.forEach(function (taskId) {
-                promises.push(
-                    Task.findById(taskId).then(function (task) {
-                        if (task && task.assignedUser === req.params.id) {
-                            task.assignedUser = "";
-                            task.assignedUserName = "unassigned";
-                            return task.save();
-                        }
-                    })
-                );
-            });
+            if (typeof newPendingTasks !== 'undefined') {
+                var tasksToRemove = oldPendingTasks.filter(function (taskId) {
+                    return newPendingTasks.indexOf(taskId) === -1;
+                });
+                var tasksToAdd = newPendingTasks.filter(function (taskId) {
+                    return oldPendingTasks.indexOf(taskId) === -1;
+                });
 
-            // Add user to newly added tasks
-            tasksToAdd.forEach(function (taskId) {
-                promises.push(
-                    Task.findById(taskId).then(function (task) {
-                        if (task) {
-                            var oldTaskUser = task.assignedUser;
-                            
-                            // If task was assigned to another user, remove from that user's pendingTasks
-                            if (oldTaskUser && oldTaskUser !== "" && oldTaskUser !== req.params.id) {
-                                return User.findById(oldTaskUser).then(function (otherUser) {
-                                    if (otherUser) {
-                                        var index = otherUser.pendingTasks.indexOf(taskId);
-                                        if (index > -1) {
-                                            otherUser.pendingTasks.splice(index, 1);
+                // Remove user from tasks no longer in pendingTasks
+                tasksToRemove.forEach(function (taskId) {
+                    promises.push(
+                        Task.findById(taskId).then(function (task) {
+                            if (task && task.assignedUser === req.params.id) {
+                                task.assignedUser = "";
+                                task.assignedUserName = "unassigned";
+                                return task.save();
+                            }
+                        })
+                    );
+                });
+
+                // Add user to newly added tasks
+                tasksToAdd.forEach(function (taskId) {
+                    promises.push(
+                        Task.findById(taskId).then(function (task) {
+                            if (task) {
+                                var oldTaskUser = task.assignedUser;
+                                
+                                // If task was assigned to another user, remove from that user's pendingTasks
+                                if (oldTaskUser && oldTaskUser !== "" && oldTaskUser !== req.params.id) {
+                                    return User.findById(oldTaskUser).then(function (otherUser) {
+                                        if (otherUser) {
+                                            var index = otherUser.pendingTasks.indexOf(taskId);
+                                            if (index > -1) {
+                                                otherUser.pendingTasks.splice(index, 1);
+                                            }
+                                            return otherUser.save();
                                         }
-                                        return otherUser.save();
-                                    }
-                                }).then(function () {
-                                    // Now update the task
+                                    }).then(function () {
+                                        // Now update the task
+                                        task.assignedUser = req.params.id;
+                                        task.assignedUserName = updatedUser.name;
+                                        return task.save();
+                                    });
+                                } else {
+                                    // No previous user, just update the task
                                     task.assignedUser = req.params.id;
                                     task.assignedUserName = updatedUser.name;
                                     return task.save();
-                                });
-                            } else {
-                                // No previous user, just update the task
-                                task.assignedUser = req.params.id;
-                                task.assignedUserName = updatedUser.name;
-                                return task.save();
+                                }
                             }
-                        }
-                    })
-                );
-            });
+                        })
+                    );
+                });
+            }
 
             Promise.all(promises).then(function () {
                 // Save user again in case pendingTasks was modified for completed tasks

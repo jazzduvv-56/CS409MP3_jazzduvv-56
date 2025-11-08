@@ -1,7 +1,24 @@
 var Task = require('../models/task');
 var User = require('../models/user');
+var mongoose = require('mongoose');
 
 module.exports = function (router) {
+
+    // Helper to compare ids robustly and keep pendingTasks unique
+    function indexOfId(arr, id) {
+        if (!arr) return -1;
+        for (var i = 0; i < arr.length; i++) {
+            if (arr[i] && arr[i].toString() === id.toString()) return i;
+        }
+        return -1;
+    }
+
+    function ensureUniquePendingTasks(user) {
+        if (user && Array.isArray(user.pendingTasks)) {
+            user.pendingTasks = user.pendingTasks.map(function (v) { return v.toString(); })
+                .filter(function (v, i, a) { return a.indexOf(v) === i; });
+        }
+    }
 
     // Collection route
     var tasksRoute = router.route('/tasks');
@@ -69,6 +86,11 @@ module.exports = function (router) {
 
         // If task is assigned to a user, validate user exists first
         if (task.assignedUser && task.assignedUser !== "") {
+            // Validate assignedUser is a valid ObjectId string; return 400 if malformed
+            if (!mongoose.Types.ObjectId.isValid(task.assignedUser)) {
+                return res.status(400).json({ message: "Assigned user id is invalid", data: {} });
+            }
+
             User.findById(task.assignedUser).then(function (user) {
                 if (!user) {
                     return res.status(400).json({ message: "Assigned user does not exist", data: {} });
@@ -101,10 +123,12 @@ module.exports = function (router) {
             savedTask.assignedUserName = user.name;
             
             // Only add to pendingTasks if task is not completed
-            if (!savedTask.completed && user.pendingTasks.indexOf(savedTask._id.toString()) === -1) {
+            if (!savedTask.completed && indexOfId(user.pendingTasks, savedTask._id) === -1) {
                 user.pendingTasks.push(savedTask._id.toString());
             }
-            
+            // Ensure pendingTasks are unique before saving
+            ensureUniquePendingTasks(user);
+
             return Promise.all([savedTask.save(), user.save()]).then(function () {
                 res.status(201).json({ message: "Created", data: savedTask });
             });
@@ -163,6 +187,11 @@ module.exports = function (router) {
 
             // If assigning to a new user, validate user exists
             if (newAssignedUser && newAssignedUser !== "" && oldAssignedUser !== newAssignedUser) {
+                // Validate ObjectId format first
+                if (!mongoose.Types.ObjectId.isValid(newAssignedUser)) {
+                    return res.status(400).json({ message: "Assigned user id is invalid", data: {} });
+                }
+
                 User.findById(newAssignedUser).then(function (user) {
                     if (!user) {
                         return res.status(400).json({ message: "Assigned user does not exist", data: {} });
@@ -181,6 +210,10 @@ module.exports = function (router) {
             } else if (newAssignedUser && newAssignedUser !== "" && oldAssignedUser === newAssignedUser) {
                 // Same user - still need to validate assignedUserName if provided
                 if (req.body.assignedUserName) {
+                    if (!mongoose.Types.ObjectId.isValid(newAssignedUser)) {
+                        return res.status(400).json({ message: "Assigned user id is invalid", data: {} });
+                    }
+
                     User.findById(newAssignedUser).then(function (user) {
                         if (user && req.body.assignedUserName !== user.name) {
                             return res.status(400).json({ message: "Assigned user name does not match user's actual name", data: {} });
@@ -229,10 +262,12 @@ module.exports = function (router) {
                 if (oldAssignedUser && oldAssignedUser !== "") {
                     promises.push(
                         User.findById(oldAssignedUser).then(function (user) {
-                            if (user) {
-                                var index = user.pendingTasks.indexOf(req.params.id);
+                                if (user) {
+                                var index = indexOfId(user.pendingTasks, req.params.id);
                                 if (index > -1) {
                                     user.pendingTasks.splice(index, 1);
+                                    // ensure uniqueness just in case
+                                    ensureUniquePendingTasks(user);
                                     return user.save();
                                 }
                             }
@@ -244,11 +279,13 @@ module.exports = function (router) {
                 if (newAssignedUser && newAssignedUser !== "" && !updatedTask.completed) {
                     promises.push(
                         User.findById(newAssignedUser).then(function (user) {
-                            if (user) {
-                                if (user.pendingTasks.indexOf(req.params.id) === -1) {
+                                if (user) {
+                                if (indexOfId(user.pendingTasks, req.params.id) === -1) {
                                     user.pendingTasks.push(req.params.id);
                                     // Also update assignedUserName to match
                                     updatedTask.assignedUserName = user.name;
+                                    // ensure uniqueness before save
+                                    ensureUniquePendingTasks(user);
                                     return Promise.all([user.save(), updatedTask.save()]);
                                 }
                             }
@@ -267,22 +304,24 @@ module.exports = function (router) {
                 }
             } else if (newAssignedUser && newAssignedUser !== "") {
                 // Same user, but check if task completion status changed
-                promises.push(
-                    User.findById(newAssignedUser).then(function (user) {
-                        if (user) {
-                            var taskIndex = user.pendingTasks.indexOf(req.params.id);
-                            if (updatedTask.completed && taskIndex > -1) {
-                                // Task completed - remove from pendingTasks
-                                user.pendingTasks.splice(taskIndex, 1);
-                                return user.save();
-                            } else if (!updatedTask.completed && taskIndex === -1) {
-                                // Task uncompleted - add to pendingTasks
-                                user.pendingTasks.push(req.params.id);
-                                return user.save();
+                        promises.push(
+                        User.findById(newAssignedUser).then(function (user) {
+                            if (user) {
+                                var taskIndex = indexOfId(user.pendingTasks, req.params.id);
+                                if (updatedTask.completed && taskIndex > -1) {
+                                    // Task completed - remove from pendingTasks
+                                    user.pendingTasks.splice(taskIndex, 1);
+                                    ensureUniquePendingTasks(user);
+                                    return user.save();
+                                } else if (!updatedTask.completed && taskIndex === -1) {
+                                    // Task uncompleted - add to pendingTasks
+                                    user.pendingTasks.push(req.params.id);
+                                    ensureUniquePendingTasks(user);
+                                    return user.save();
+                                }
                             }
-                        }
-                    })
-                );
+                        })
+                    );
             }
 
             Promise.all(promises).then(function () {
@@ -309,10 +348,11 @@ module.exports = function (router) {
                 // Remove from assigned user's pendingTasks
                 if (assignedUser && assignedUser !== "") {
                     User.findById(assignedUser).then(function (user) {
-                        if (user) {
-                            var index = user.pendingTasks.indexOf(req.params.id);
+                            if (user) {
+                            var index = indexOfId(user.pendingTasks, req.params.id);
                             if (index > -1) {
                                 user.pendingTasks.splice(index, 1);
+                                ensureUniquePendingTasks(user);
                                 return user.save().then(function () {
                                     res.status(204).send();
                                 });
